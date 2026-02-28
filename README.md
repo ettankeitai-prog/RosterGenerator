@@ -376,6 +376,26 @@ RosterGenerator
 
   <div class="wrap">
     <div class="panel">
+
+      <h2>生成</h2>
+
+      <div class="row">
+        <button id="btnGenerate" class="primary">自動生成（上位4案）</button>
+        <button id="btnStop">停止</button>
+        <button id="btnPrint" title="A4横で印刷→PDF保存（Ctrl+P / ⌘+P）">印刷（PDF）</button>
+      </div>
+
+      <div class="row">
+        <button id="btnEmpExport" class="secondary" title="社員リスト・フラグ・希望休/希望勤務をCSVで保存">社員CSV出力</button>
+        <button id="btnEmpImport" class="secondary" title="社員CSVを読み込んで復元">社員CSV読込</button>
+        <button id="btnResultExport" class="secondary" title="表示中のシフト結果をCSVで出力">結果CSV出力</button>
+        <button id="btnResultExportStyled" class="secondary" title="表示中のシフト表をExcelで開ける見た目付き（.xls）で出力">見た目Excel出力</button>
+        <input id="empCsvFile" type="file" accept=".csv,text/csv" style="display:none" />
+      </div>
+
+      <div class="small" id="progressText">待機中</div>
+      
+      <div class="hr"></div>
       <h2>設定</h2>
 
       <div class="row">
@@ -454,22 +474,6 @@ RosterGenerator
         <span class="small">（目安：最大12名程度）</span>
       </div>
       <div id="empList"></div>
-
-      <div class="row">
-        <button id="btnGenerate" class="primary">自動生成（上位4案）</button>
-        <button id="btnStop">停止</button>
-        <button id="btnPrint" title="A4横で印刷→PDF保存（Ctrl+P / ⌘+P）">印刷（PDF）</button>
-      </div>
-
-      <div class="row">
-        <button id="btnEmpExport" class="secondary" title="社員リスト・フラグ・希望休/希望勤務をCSVで保存">社員CSV出力</button>
-        <button id="btnEmpImport" class="secondary" title="社員CSVを読み込んで復元">社員CSV読込</button>
-        <button id="btnResultExport" class="secondary" title="表示中のシフト結果をCSVで出力">結果CSV出力</button>
-        <input id="empCsvFile" type="file" accept=".csv,text/csv" style="display:none" />
-      </div>
-
-      <div class="small" id="progressText">待機中</div>
-
       <div class="legend">
         <span>上段: 日にち / 下段: 曜日</span>
         <span>日=左</span>
@@ -513,6 +517,751 @@ RosterGenerator
       ・希望休ハードON時、希望休当日は「休」固定です。
     </div>
   </div>
+
+<script id="workerCode" type="text/plain">
+
+(() => {
+  const SHIFT = { OFF:"OFF", DAY:"DAY", NIGHT:"NIGHT", AKE:"AKE", D_OFF:"D_OFF" };
+  let paidMode = "none";
+
+  const deepCopySchedule = (s) => ({ assign: s.assign.map(r => r.slice()) });
+  const scheduleKey = (s) => s.assign.map(r => r.join("|")).join("||");
+  const emptySchedule = (nEmp, nDay) => ({ assign: Array.from({length:nEmp}, () => Array(nDay).fill(SHIFT.OFF)) });
+
+  const empTotalMin = (schedule, e, workMin, paidMode, employees) => {
+    let t = 0;
+    const row = schedule.assign[e];
+    const paidArr = employees && employees[e] ? employees[e].paidIdxSet : null;
+
+    for (let i = 0; i < row.length; i++) {
+      const sh = row[i];
+      let add = (workMin[sh] ?? 0);
+
+      // 有給モード2: 休み(OFF/D_OFF)だが 8h(=日勤) を労働時間に加算
+      if (paidMode === 2 && paidArr && paidArr[i] && (sh === SHIFT.OFF || sh === SHIFT.D_OFF)) {
+        add += 480;
+      }
+      t += add;
+    }
+    return t;
+  };
+  const empNightCount = (schedule, e) => schedule.assign[e].filter(x => x===SHIFT.NIGHT).length;
+
+  const empOffNoAkeCount = (schedule, e) => {
+    const row = schedule.assign[e];
+    let c=0;
+    for (let i=0;i<row.length;i++){
+      const sh = row[i];
+      if (sh === SHIFT.OFF || sh === SHIFT.D_OFF) c++;
+    }
+    return c;
+  };
+
+  function computeDCounts(schedule, days, employees) {
+    const nEmp = employees.length;
+    const nDay = days.length;
+    const dEarn = Array(nEmp).fill(0);
+    const dOff = Array(nEmp).fill(0);
+
+    for (let e=0; e<nEmp; e++) for (let i=0; i<nDay; i++) {
+      if (schedule.assign[e][i] === SHIFT.D_OFF) dOff[e]++;
+    }
+
+    for (let e=0; e<nEmp; e++) {
+      if (!employees[e].proper) continue;
+      for (let i=0; i<nDay; i++) {
+        const sh = schedule.assign[e][i];
+        const day = days[i];
+        if (sh === SHIFT.DAY && day.isHolOrWeekend) dEarn[e]++;
+        if (sh === SHIFT.NIGHT && day.isHoliday) dEarn[e]++;
+        if (sh === SHIFT.NIGHT && i+1 < nDay) {
+          const endDay = days[i+1];
+          if (endDay.isHolOrWeekend) dEarn[e]++;
+        }
+      }
+    }
+    return { dEarn, dOff };
+  }
+
+  function isHardOffDay(employees, e, i, hardReqOffEnabled) {
+    const isReq = !!(hardReqOffEnabled && employees[e].reqOffIdxSet && employees[e].reqOffIdxSet[i]);
+    const isPaid = !!(employees[e].paidIdxSet && employees[e].paidIdxSet[i]);
+    return isReq || isPaid;
+  }
+
+  function isValidLocal(schedule, days, employees, e, i, sh, cfg, hardReqOffEnabled) {
+    const cur = schedule.assign[e][i];
+
+    // 前月末夜勤 → 当月1日は明け固定（変更不可）
+    if (i === 0 && employees[e].prevMonthNight) {
+      return sh === SHIFT.AKE;
+    }
+
+    if (isHardOffDay(employees, e, i, hardReqOffEnabled)) {
+      return (sh === SHIFT.OFF || sh === SHIFT.D_OFF);
+    }
+
+    if (cur === SHIFT.AKE && (sh === SHIFT.DAY || sh === SHIFT.NIGHT)) return false;
+
+    if (cfg.noDayAfterAke && sh === SHIFT.DAY && i>0 && schedule.assign[e][i-1] === SHIFT.AKE) return false;
+
+    if (sh === SHIFT.NIGHT) {
+      // ★日勤5連続の翌日は「休」必須（夜勤も禁止）
+      let run = 0;
+      for (let k=i-1; k>=0 && schedule.assign[e][k]===SHIFT.DAY; k--) run++;
+      if (run >= cfg.maxConsecDay) return false;
+
+      if (employees[e].proper && days[i].isHolOrWeekend) return false;
+
+      if (i+1 < days.length) {
+        const nxt = schedule.assign[e][i+1];
+        if (nxt === SHIFT.DAY || nxt === SHIFT.NIGHT) return false;
+        if (isHardOffDay(employees, e, i+1, hardReqOffEnabled)) return false;
+      }
+      if (i>0 && schedule.assign[e][i-1] === SHIFT.NIGHT) return false;
+    }
+
+    if (sh === SHIFT.DAY) {
+      let c=1;
+      for (let k=i-1; k>=0 && schedule.assign[e][k]===SHIFT.DAY; k--) c++;
+      for (let k=i+1; k<days.length && schedule.assign[e][k]===SHIFT.DAY; k++) c++;
+      if (c > cfg.maxConsecDay) return false;
+    }
+
+    return true;
+  }
+
+  function enforceHardOff(schedule, employees, hardReqOffEnabled) {
+    if (!hardReqOffEnabled) return;
+    const nEmp = employees.length, nDay = schedule.assign[0].length;
+
+    for (let e=0;e<nEmp;e++){
+      const reqArr = employees[e].reqOffIdxSet;
+      const paidArr = employees[e].paidIdxSet;
+      if (!reqArr && !paidArr) continue;
+
+      for (let i=0; i<nDay; i++){
+        const hard = (!!(reqArr && reqArr[i] && hardReqOffEnabled)) || (!!(paidArr && paidArr[i]));
+        if (!hard) continue;
+        if (i>0 && schedule.assign[e][i-1] === SHIFT.NIGHT) schedule.assign[e][i-1] = SHIFT.OFF;
+        schedule.assign[e][i] = SHIFT.OFF;
+        if (i+1 < nDay && schedule.assign[e][i+1] === SHIFT.AKE) schedule.assign[e][i+1] = SHIFT.OFF;
+      }
+    }
+  }
+
+  function enforcePrevMonthAke(schedule, employees) {
+    if (!schedule || !schedule.assign || !schedule.assign.length) return;
+    const nEmp = employees.length;
+    const nDay = schedule.assign[0].length;
+    if (nDay <= 0) return;
+    for (let e=0;e<nEmp;e++){
+      if (!employees[e].prevMonthNight) continue;
+      schedule.assign[e][0] = SHIFT.AKE;
+    }
+  }
+
+  function normalizeAkeConsistency(schedule, days, employees, cfg, hardReqOffEnabled) {
+    const nEmp = employees.length;
+    const nDay = days.length;
+
+    // 1) 先月末が夜勤なら当月1日は「明」で固定（表示/カウントはUI側で調整）
+    for (let e=0; e<nEmp; e++) {
+      if (employees[e].prevMonthNight) schedule.assign[e][0] = SHIFT.AKE;
+    }
+
+    // 2) 孤立した「明」（前日が夜勤でない明）はOFFに戻す（※1日固定の明は除外）
+    for (let e=0; e<nEmp; e++) {
+      for (let i=0; i<nDay; i++) {
+        if (i === 0 && employees[e].prevMonthNight) continue;
+        if (schedule.assign[e][i] === SHIFT.AKE) {
+          if (i === 0 || schedule.assign[e][i-1] !== SHIFT.NIGHT) {
+            schedule.assign[e][i] = SHIFT.OFF;
+          }
+        }
+      }
+    }
+
+    // 3) 夜勤は必ず翌日「明」にする（希望休ハードで翌日OFF固定なら夜勤自体をOFFに戻す）
+    for (let e=0; e<nEmp; e++) {
+      for (let i=0; i<nDay-1; i++) {
+        if (schedule.assign[e][i] !== SHIFT.NIGHT) continue;
+
+        if (hardReqOffEnabled && employees[e].reqOffIdxSet && employees[e].reqOffIdxSet[i+1]) {
+          schedule.assign[e][i] = SHIFT.OFF;
+          continue;
+        }
+        schedule.assign[e][i+1] = SHIFT.AKE;
+      }
+    }
+
+    // 4) 希望休ハード日の「明」は前日の夜勤を解除してOFFにする
+    if (hardReqOffEnabled) {
+      for (let e=0; e<nEmp; e++) {
+        const arr = employees[e].reqOffIdxSet;
+        if (!arr) continue;
+        for (let i=0; i<nDay; i++) {
+          if (!arr[i]) continue;
+          if (schedule.assign[e][i] === SHIFT.AKE && i > 0 && schedule.assign[e][i-1] === SHIFT.NIGHT) {
+            schedule.assign[e][i-1] = SHIFT.OFF;
+            schedule.assign[e][i] = SHIFT.OFF;
+          }
+        }
+      }
+    }
+  }
+
+
+  function allocateDOff(schedule, days, employees, cfg, hardReqOffEnabled) {
+    const nEmp = employees.length;
+    const nDay = days.length;
+
+    for (let e=0;e<nEmp;e++) for (let i=0;i<nDay;i++){
+      if (schedule.assign[e][i]===SHIFT.D_OFF) schedule.assign[e][i]=SHIFT.OFF;
+    }
+
+    const dayCount = (i) => {
+      let c=0;
+      for (let e=0;e<nEmp;e++) if (schedule.assign[e][i]===SHIFT.DAY) c++;
+      return c;
+    };
+
+    const canPutDay = (f, i) => {
+      const cur = schedule.assign[f][i];
+      if (cur === SHIFT.NIGHT || cur === SHIFT.AKE) return false;
+      if (cur === SHIFT.DAY) return false;
+      return isValidLocal(schedule, days, employees, f, i, SHIFT.DAY, cfg, hardReqOffEnabled);
+    };
+
+    const { dEarn } = computeDCounts(schedule, days, employees);
+
+    for (let e=0; e<nEmp; e++) {
+      if (!employees[e].proper) continue;
+
+      let need = dEarn[e];
+      if (need <= 0) continue;
+
+      const offSlots = [];
+      for (let i=0;i<nDay;i++){
+        if (days[i].isHolOrWeekend) continue;
+        if (schedule.assign[e][i] === SHIFT.OFF) {
+          if (hardReqOffEnabled && isHardOffDay(employees, e, i, hardReqOffEnabled)) continue;
+          offSlots.push(i);
+        }
+      }
+      for (let k=0; k<offSlots.length && need>0; k++){
+        schedule.assign[e][offSlots[k]] = SHIFT.D_OFF;
+        need--;
+      }
+      if (need === 0) continue;
+
+      const daySlots = [];
+      for (let i=0;i<nDay;i++){
+        if (days[i].isHolOrWeekend) continue;
+        if (schedule.assign[e][i] === SHIFT.DAY) daySlots.push(i);
+      }
+      for (let i=daySlots.length-1;i>0;i--){
+        const j = (Math.random()*(i+1))|0;
+        [daySlots[i],daySlots[j]]=[daySlots[j],daySlots[i]];
+      }
+
+      for (let idx=0; idx<daySlots.length && need>0; idx++){
+        const i = daySlots[idx];
+        const dc = dayCount(i);
+
+        if (dc - 1 >= cfg.minDay) {
+          schedule.assign[e][i] = SHIFT.D_OFF;
+          need--;
+          continue;
+        }
+
+        let filled = false;
+        for (let f=0; f<nEmp; f++){
+          if (f===e) continue;
+          if (!canPutDay(f, i)) continue;
+
+          schedule.assign[f][i] = SHIFT.DAY;
+          schedule.assign[e][i] = SHIFT.D_OFF;
+          filled = true;
+          need--;
+          break;
+        }
+        if (!filled) schedule.assign[e][i] = SHIFT.DAY;
+      }
+
+      if (need > 0) return false;
+    }
+
+    return true;
+  }
+
+  function hardViolationsCount(schedule, days, employees, cfg, monthRules, hardReqOffEnabled) {
+    const nEmp = employees.length;
+    const nDay = days.length;
+    let issues = 0;
+
+    for (let i=0;i<nDay;i++){
+      let dayCnt=0, nightCnt=0;
+      for (let e=0;e<nEmp;e++){
+        const sh = schedule.assign[e][i];
+        if (sh===SHIFT.DAY) dayCnt++;
+        if (sh===SHIFT.NIGHT) nightCnt++;
+      }
+      if (nightCnt !== cfg.requiredNight) issues++;
+      if (dayCnt < cfg.minDay) issues++;
+      if (dayCnt > cfg.maxDay) issues++;
+    }
+
+    for (let e=0;e<nEmp;e++){
+      let consecDay=0;
+      let nightSetRun=0;
+
+      for (let i=0;i<nDay;i++){
+        const sh = schedule.assign[e][i];
+
+        if (isHardOffDay(employees, e, i, hardReqOffEnabled)) {
+          if (sh !== SHIFT.OFF && sh !== SHIFT.D_OFF) issues++;
+        }
+
+        if (sh===SHIFT.DAY) consecDay++; else consecDay=0;
+        // ★日勤5連続の翌日は「休」必須（夜勤も禁止）
+        if (sh===SHIFT.NIGHT) {
+          let run=0;
+          for (let k=i-1; k>=0 && schedule.assign[e][k]===SHIFT.DAY; k--) run++;
+          if (run >= cfg.maxConsecDay) issues++;
+        }
+        if (consecDay > cfg.maxConsecDay) issues++;
+
+        if (employees[e].proper && sh===SHIFT.NIGHT && days[i].isHolOrWeekend) issues++;
+        if (sh===SHIFT.NIGHT && i+1 < nDay && schedule.assign[e][i+1] !== SHIFT.AKE) issues++;
+        if (i>0 && schedule.assign[e][i-1]===SHIFT.NIGHT && sh===SHIFT.NIGHT) issues++;
+        if (cfg.noDayAfterAke && i>0 && schedule.assign[e][i-1]===SHIFT.AKE && sh===SHIFT.DAY) issues++;
+
+        if (sh===SHIFT.NIGHT) {
+          const continues = (i>=2 && schedule.assign[e][i-1]===SHIFT.AKE && schedule.assign[e][i-2]===SHIFT.NIGHT);
+          nightSetRun = continues ? (nightSetRun+1) : 1;
+          if (nightSetRun > cfg.maxNightSetRun) issues++;
+        }
+        if (sh !== SHIFT.NIGHT && sh !== SHIFT.AKE) nightSetRun = 0;
+      }
+    }
+
+    for (let e=0;e<nEmp;e++){
+      const total = empTotalMin(schedule,e,cfg.workMin,paidMode,employees);
+      if (monthRules.minMin>0 && total < monthRules.minMin) issues++;
+      if (monthRules.maxMin>0 && total > monthRules.maxMin) issues++;
+    }
+
+    const { dEarn, dOff } = computeDCounts(schedule, days, employees);
+    for (let e=0;e<nEmp;e++){
+      if (!employees[e].proper) continue;
+      if (dEarn[e] > cfg.maxDDays) issues++;
+      if (dEarn[e] !== dOff[e]) issues++;
+    }
+
+    return issues;
+  }
+
+  function scoreSchedule(schedule, days, employees, cfg, monthRules) {
+    const nEmp = employees.length;
+    const nDay = days.length;
+    let score = 0;
+
+    for (let i=0;i<nDay;i++){
+      let dayCnt=0, nightCnt=0;
+      for (let e=0;e<nEmp;e++){
+        const sh = schedule.assign[e][i];
+        if (sh===SHIFT.DAY) dayCnt++;
+        if (sh===SHIFT.NIGHT) nightCnt++;
+      }
+
+      score -= Math.abs(nightCnt - cfg.requiredNight) * 5000;
+      if (dayCnt < cfg.minDay) score -= (cfg.minDay - dayCnt) * 5000;
+      if (dayCnt > cfg.maxDay) score -= (dayCnt - cfg.maxDay) * 5000;
+
+      score -= Math.abs(dayCnt - cfg.targetDay) * 60;
+    }
+
+    for (let e=0;e<nEmp;e++){
+      const total = empTotalMin(schedule,e,cfg.workMin,paidMode,employees);
+      score -= Math.abs(total - monthRules.stdMin) * 0.6;
+    }
+
+    // 平日日勤優先（強化：ほぼ固定 + 夜勤は月1〜3回想定）
+    for (let e=0;e<nEmp;e++){
+      if (!employees[e].weekdayDayPriority) continue;
+
+      let nightCnt = 0;
+      for (let i=0;i<nDay;i++){
+        const sh = schedule.assign[e][i];
+        if (sh===SHIFT.NIGHT) nightCnt++;
+
+        // 平日（祝日/土日以外）は「日」寄せ
+        if (!days[i].isHolOrWeekend) {
+          if (sh===SHIFT.DAY) score += 200;
+          else if (sh===SHIFT.OFF || sh===SHIFT.D_OFF) score -= 220;
+          else if (sh===SHIFT.NIGHT) score -= 320;
+          else if (sh===SHIFT.AKE) score -= 120;
+        } else {
+          // 土日祝は「休」寄せ（ただし必須人数の都合で出勤は許容）
+          if (sh===SHIFT.OFF || sh===SHIFT.D_OFF) score += 40;
+          else if (sh===SHIFT.DAY) score -= 25;
+          else if (sh===SHIFT.NIGHT) score -= 10;
+          else if (sh===SHIFT.AKE) score -= 5;
+        }
+      }
+
+      // 夜勤回数の目安（ソフト）
+      const MIN_N = 1, MAX_N = 3;
+      if (nightCnt < MIN_N) score -= (MIN_N - nightCnt) * 800;
+      if (nightCnt > MAX_N) score -= (nightCnt - MAX_N) * 800;
+    }
+
+    const W_MATCH = 25;
+    const W_MISS  = 30;
+    for (let e=0;e<nEmp;e++){
+      const wish = employees[e].wishShiftIdxMap;
+      if (!wish) continue;
+      for (let i=0;i<nDay;i++){
+        const w = wish[i];
+        if (!w) continue;
+        const sh = schedule.assign[e][i];
+        if (sh === w) score += W_MATCH;
+        else score -= W_MISS;
+      }
+    }
+
+    const { dEarn, dOff } = computeDCounts(schedule, days, employees);
+    for (let e=0;e<nEmp;e++){
+      if (!employees[e].proper) continue;
+      score -= dEarn[e] * 5;
+      score -= Math.abs(dEarn[e]-dOff[e]) * 200;
+    }
+
+    const offCounts = new Array(nEmp);
+    let sumOff = 0;
+    for (let e=0;e<nEmp;e++){
+      const c = empOffNoAkeCount(schedule, e);
+      offCounts[e] = c;
+      sumOff += c;
+    }
+    const meanOff = sumOff / Math.max(1, nEmp);
+    const OFF_STD_WEIGHT = 200;
+    for (let e=0;e<nEmp;e++){
+      score -= Math.abs(offCounts[e] - meanOff) * OFF_STD_WEIGHT;
+    }
+
+    return score;
+  }
+
+  function repairStaffing(s, days, employees, cfg, monthRules, hardReqOffEnabled) {
+    const nEmp = employees.length, nDay = days.length;
+
+    enforcePrevMonthAke(s, employees);
+    enforceHardOff(s, employees, hardReqOffEnabled);
+    normalizeAkeConsistency(s, days, employees, cfg, hardReqOffEnabled);
+
+    for (let i=0;i<nDay;i++){
+      const nightEs = [];
+      for (let e=0;e<nEmp;e++) if (s.assign[e][i]===SHIFT.NIGHT) nightEs.push(e);
+
+      if (nightEs.length > cfg.requiredNight) {
+        while (nightEs.length > cfg.requiredNight) {
+          const e = nightEs.pop();
+          s.assign[e][i] = SHIFT.OFF;
+        }
+      } else if (nightEs.length < cfg.requiredNight) {
+        const need = cfg.requiredNight - nightEs.length;
+        const cand = [];
+        for (let e=0;e<nEmp;e++){
+          if (s.assign[e][i]===SHIFT.NIGHT) continue;
+          if (!isValidLocal(s, days, employees, e, i, SHIFT.NIGHT, cfg, hardReqOffEnabled)) continue;
+          cand.push({e, n: empNightCount(s,e), t: empTotalMin(s,e,cfg.workMin,paidMode,employees), r: Math.random()});
+        }
+        cand.sort((a,b)=> (a.n-b.n)||(a.t-b.t)||(a.r-b.r));
+        for (let k=0;k<need && k<cand.length;k++){
+          const ePick = cand[k].e;
+          s.assign[ePick][i] = SHIFT.NIGHT;
+          if (i+1 < nDay) s.assign[ePick][i+1] = SHIFT.AKE;
+        }
+      }
+
+      if (i+1 < nDay) {
+        for (let e=0;e<nEmp;e++){
+          if (s.assign[e][i]===SHIFT.NIGHT) s.assign[e][i+1] = SHIFT.AKE;
+        }
+      }
+    }
+
+    for (let i=0;i<nDay;i++){
+      let dayCnt=0;
+      for (let e=0;e<nEmp;e++) if (s.assign[e][i]===SHIFT.DAY) dayCnt++;
+      if (dayCnt >= cfg.minDay) continue;
+
+      const need = cfg.minDay - dayCnt;
+      const cand = [];
+      for (let e=0;e<nEmp;e++){
+        const cur = s.assign[e][i];
+        if (cur===SHIFT.NIGHT || cur===SHIFT.AKE || cur===SHIFT.DAY) continue;
+        if (!isValidLocal(s, days, employees, e, i, SHIFT.DAY, cfg, hardReqOffEnabled)) continue;
+        const t = empTotalMin(s,e,cfg.workMin,paidMode,employees);
+        const pref = (employees[e].weekdayDayPriority && !days[i].isHolOrWeekend) ? -1 : 0;
+        cand.push({e, pref, t, r: Math.random()});
+      }
+      cand.sort((a,b)=> (a.pref-b.pref)||(a.t-b.t)||(a.r-b.r));
+      for (let k=0;k<need && k<cand.length;k++) s.assign[cand[k].e][i] = SHIFT.DAY;
+    }
+
+    for (let i=0;i<nDay;i++){
+      let dayEs = [];
+      for (let e=0;e<nEmp;e++) if (s.assign[e][i]===SHIFT.DAY) dayEs.push(e);
+      if (dayEs.length <= cfg.maxDay) continue;
+
+      const cand = dayEs.map(e => ({
+        e,
+        pref: (employees[e].weekdayDayPriority && !days[i].isHolOrWeekend) ? 1 : 0,
+        t: empTotalMin(s,e,cfg.workMin,paidMode,employees),
+        r: Math.random()
+      }));
+      cand.sort((a,b)=> (b.pref-a.pref) || (a.t-b.t) || (a.r-b.r));
+
+      for (let k=cfg.maxDay; k<cand.length; k++){
+        s.assign[cand[k].e][i] = SHIFT.OFF;
+      }
+    }
+
+    allocateDOff(s, days, employees, cfg, hardReqOffEnabled);
+    enforceHardOff(s, employees, hardReqOffEnabled);
+    normalizeAkeConsistency(s, days, employees, cfg, hardReqOffEnabled);
+    enforcePrevMonthAke(s, employees);
+  }
+
+  function buildInitialSchedule(days, employees, cfg, monthRules, hardReqOffEnabled) {
+    const s = emptySchedule(employees.length, days.length);
+
+    enforcePrevMonthAke(s, employees);
+    enforceHardOff(s, employees, hardReqOffEnabled);
+    enforcePrevMonthAke(s, employees);
+
+    for (let i=0;i<days.length;i++){
+      const cand = [];
+      for (let e=0;e<employees.length;e++){
+        if (!isValidLocal(s, days, employees, e, i, SHIFT.NIGHT, cfg, hardReqOffEnabled)) continue;
+        cand.push({e, n: empNightCount(s,e), t: empTotalMin(s,e,cfg.workMin,paidMode,employees), r:Math.random()});
+      }
+      cand.sort((a,b)=> (a.n-b.n)||(a.t-b.t)||(a.r-b.r));
+      if (cand.length < cfg.requiredNight) return null;
+      for (let k=0;k<cfg.requiredNight;k++){
+        const ePick = cand[k].e;
+        s.assign[ePick][i] = SHIFT.NIGHT;
+        if (i+1 < days.length) s.assign[ePick][i+1] = SHIFT.AKE;
+      }
+    }
+
+    for (let i=0;i<days.length;i++){
+      const cand = [];
+      for (let e=0;e<employees.length;e++){
+        const cur = s.assign[e][i];
+        if (cur===SHIFT.NIGHT || cur===SHIFT.AKE) continue;
+        if (!isValidLocal(s, days, employees, e, i, SHIFT.DAY, cfg, hardReqOffEnabled)) continue;
+        const t = empTotalMin(s,e,cfg.workMin,paidMode,employees);
+        const pref = (employees[e].weekdayDayPriority && !days[i].isHolOrWeekend) ? -1 : 0;
+        cand.push({e, pref, t, r:Math.random()});
+      }
+      cand.sort((a,b)=> (a.pref-b.pref)||(a.t-b.t)||(a.r-b.r));
+      if (cand.length < cfg.minDay) return null;
+
+      for (let k=0; k<cfg.minDay; k++) s.assign[cand[k].e][i] = SHIFT.DAY;
+
+      const extra = Math.min(cfg.maxDay, cfg.targetDay) - cfg.minDay;
+      for (let k=0; k<extra; k++){
+        const idx = cfg.minDay + k;
+        if (idx < cand.length) s.assign[cand[idx].e][i] = SHIFT.DAY;
+      }
+    }
+
+    if (!allocateDOff(s, days, employees, cfg, hardReqOffEnabled)) return null;
+    repairStaffing(s, days, employees, cfg, monthRules, hardReqOffEnabled);
+    return s;
+  }
+
+  function mutate(schedule, days, employees, cfg, monthRules, hardReqOffEnabled) {
+    const s = deepCopySchedule(schedule);
+    const nEmp = employees.length;
+    const nDay = days.length;
+
+    const op = Math.random();
+
+    if (op < 0.45) {
+      let i = (Math.random()*nDay)|0;
+      if (nDay > 1 && i === 0) i = 1;
+      const a = (Math.random()*nEmp)|0;
+      let b = (Math.random()*nEmp)|0;
+      if (a===b) b = (b+1)%nEmp;
+
+      if (!isHardOffDay(employees, a, i, hardReqOffEnabled) && !isHardOffDay(employees, b, i, hardReqOffEnabled)) {
+        const sa = s.assign[a][i], sb = s.assign[b][i];
+        if (sa === SHIFT.AKE || sb === SHIFT.AKE) {
+          if (s.assign[a][i] !== SHIFT.NIGHT && s.assign[a][i] !== SHIFT.AKE) {
+            s.assign[a][i] = (s.assign[a][i] === SHIFT.DAY ? SHIFT.OFF : SHIFT.DAY);
+            if (sa === SHIFT.D_OFF) s.assign[a][i] = SHIFT.OFF;
+          }
+        } else {
+          s.assign[a][i] = sb;
+          s.assign[b][i] = sa;
+        }
+      }
+    } else if (op < 0.75) {
+      const e = (Math.random()*nEmp)|0;
+      let i = (Math.random()*nDay)|0;
+      if (nDay > 1 && i === 0) i = 1;
+      if (!isHardOffDay(employees, e, i, hardReqOffEnabled)) {
+        const cur = s.assign[e][i];
+        if (cur !== SHIFT.NIGHT && cur !== SHIFT.AKE) {
+          s.assign[e][i] = (cur === SHIFT.DAY ? SHIFT.OFF : SHIFT.DAY);
+          if (cur === SHIFT.D_OFF) s.assign[e][i] = SHIFT.OFF;
+        }
+      }
+    } else {
+      let i = (Math.random()*nDay)|0;
+      if (nDay > 1 && i === 0) i = 1;
+      for (let e=0;e<nEmp;e++) if (s.assign[e][i]===SHIFT.NIGHT) s.assign[e][i]=SHIFT.OFF;
+      if (i+1<nDay) for (let e=0;e<nEmp;e++) if (s.assign[e][i+1]===SHIFT.AKE) s.assign[e][i+1]=SHIFT.OFF;
+
+      const cand = [];
+      for (let e=0;e<nEmp;e++){
+        if (!isValidLocal(s, days, employees, e, i, SHIFT.NIGHT, cfg, hardReqOffEnabled)) continue;
+        cand.push({e, n: empNightCount(s,e), t: empTotalMin(s,e,cfg.workMin,paidMode,employees), r:Math.random()});
+      }
+      cand.sort((a,b)=> (a.n-b.n)||(a.t-b.t)||(a.r-b.r));
+      if (cand.length >= cfg.requiredNight) {
+        for (let k=0;k<cfg.requiredNight;k++){
+          const ePick = cand[k].e;
+          s.assign[ePick][i] = SHIFT.NIGHT;
+          if (i+1<nDay) s.assign[ePick][i+1]=SHIFT.AKE;
+        }
+      }
+    }
+
+    repairStaffing(s, days, employees, cfg, monthRules, hardReqOffEnabled);
+    return s;
+  }
+
+  function buildSummary(schedule, employees, cfg, monthRules, days) {
+    const nEmp = employees.length;
+    const totals = employees.map((_,e)=> empTotalMin(schedule,e,cfg.workMin,paidMode,employees));
+    const avg = totals.reduce((a,b)=>a+b,0)/nEmp;
+
+    const { dEarn, dOff } = computeDCounts(schedule, days, employees);
+    const properInfo = employees
+      .map((emp,e)=> emp.proper ? `\${emp.name}:D勤\${dEarn[e]}/D休\${dOff[e]}` : null)
+      .filter(Boolean)
+      .slice(0,6)
+      .join(" / ");
+
+    return {
+      avgHr:(avg/60).toFixed(1),
+      minHr:(Math.min(...totals)/60).toFixed(1),
+      maxHr:(Math.max(...totals)/60).toFixed(1),
+      properInfo
+    };
+  }
+
+  function search(payload) {
+    const start = performance.now();
+    const limitMs = payload.limitMs;
+
+    const cfg = {
+      requiredNight: payload.requiredNight,
+      minDay: payload.minDay,
+      maxDay: payload.maxDay,
+      targetDay: payload.targetDay,
+      maxConsecDay: payload.maxConsecDay,
+      maxNightSetRun: payload.maxNightSetRun,
+      noDayAfterAke: payload.noDayAfterAke,
+      maxDDays: payload.maxDDays,
+      workMin: payload.workMin,
+    };
+
+    const employees = payload.employees;
+    const days = payload.days;
+    const monthRules = payload.monthRules;
+    const hardReqOffEnabled = !!payload.hardReqOffEnabled;
+    paidMode = payload.paidMode || "none";
+
+    // --- A案：初期解（init）を内部でリトライしてから探索開始 ---
+    let init = null;
+    const INIT_TRIES_MAX = 120;
+    for (let t=0; t<INIT_TRIES_MAX; t++){
+      init = buildInitialSchedule(days, employees, cfg, monthRules, hardReqOffEnabled);
+      if (init) break;
+      if (performance.now() - start > limitMs * 0.20) break;
+    }
+    if (!init) return { iter:0, candidates:[] };
+
+    const seen = new Set();
+    const best = [];
+
+    function consider(s) {
+      const hv = hardViolationsCount(s, days, employees, cfg, monthRules, hardReqOffEnabled);
+      if (hv !== 0) return;
+
+      const sc = scoreSchedule(s, days, employees, cfg, monthRules);
+      const key = scheduleKey(s);
+      if (seen.has(key)) return;
+      seen.add(key);
+
+      best.push({ score: sc, schedule: s, summary: buildSummary(s, employees, cfg, monthRules, days) });
+      best.sort((a,b)=> b.score - a.score);
+      if (best.length > 4) best.pop();
+    }
+
+    let cur = init;
+    consider(cur);
+
+    let iter = 0;
+    let lastProgress = 0;
+
+    while (performance.now() - start < limitMs) {
+      iter++;
+      const nxt = mutate(cur, days, employees, cfg, monthRules, hardReqOffEnabled);
+
+      const hvCur = hardViolationsCount(cur, days, employees, cfg, monthRules, hardReqOffEnabled);
+      const hvNxt = hardViolationsCount(nxt, days, employees, cfg, monthRules, hardReqOffEnabled);
+
+      const scCur = scoreSchedule(cur, days, employees, cfg, monthRules) - hvCur * 10000;
+      const scNxt = scoreSchedule(nxt, days, employees, cfg, monthRules) - hvNxt * 10000;
+
+      const elapsed = performance.now() - start;
+      const t = Math.max(0.05, 1.0 - elapsed/limitMs);
+      const accept = (scNxt >= scCur) || (Math.random() < Math.exp((scNxt - scCur) / (220 * t)));
+      if (accept) cur = nxt;
+
+      consider(nxt);
+      if (best.length === 4 && iter % 250 === 0) cur = deepCopySchedule(best[0].schedule);
+
+      if (elapsed - lastProgress > 150) {
+        lastProgress = elapsed;
+        postMessage({ type:"progress", iter, elapsedMs: elapsed, bestCount: best.length });
+      }
+    }
+
+    return { iter, candidates: best };
+  }
+
+  onmessage = (ev) => {
+    try {
+      const msg = ev.data;
+      if (!msg || msg.type !== "start") return;
+      const result = search(msg);
+      postMessage({ type:"done", iter: result.iter, candidates: result.candidates });
+    } catch (e) {
+      postMessage({ type:"error", error: (e && e.stack) ? e.stack : String(e) });
+    }
+  };
+})();
+
+</script>
 
 <script>
 (() => {
@@ -632,6 +1381,18 @@ RosterGenerator
     if (!isAllEmpty) rows.push(row);
     return rows;
   }
+
+  function downloadBlob(filename, blob) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
 
   // ===== “日だけ”入力パース =====
   function parseDayList(text, lastDay) {
@@ -1519,786 +2280,258 @@ grid.appendChild(wishHint);
     if (sh === SHIFT.D_OFF) return "休(D)";
     return "休";
   }
+  
+  // ===== 結果CSV出力（テキスト：簡易） =====
   function exportResultCSV() {
-    if (!state.currentSchedule) {
-      alert("先にシフトを作成（または候補を表示）してください。");
-      return;
-    }
-
+    if (!state.currentSchedule) { alert("先にシフトを生成してください"); return; }
     readInputs();
     buildEmployeesPayloadAndView();
 
     const days = state.days;
-    const rows = [];
-    rows.push(["name", ...days.map(d => d.dateStr)]);
+    const empsView = state.parsedEmployeesForView || [];
+    const paidMode = getPaidMode(); // 0/1/2
 
-    for (let e=0; e<state.employees.length; e++) {
-      const row = [state.employees[e].name];
-      for (let i=0; i<days.length; i++) row.push(shiftToJP(state.currentSchedule.assign[e][i]));
+    const dowJP = ["日","月","火","水","木","金","土"];
+    const header = ["社員"].concat(days.map(d => `${d.d}(${dowJP[d.dow]})`));
+
+    const rows = [header];
+
+    for (let e=0; e<state.employees.length; e++){
+      const empName = state.employees[e].name;
+      const row = [empName];
+      for (let i=0;i<days.length;i++){
+        const sh = state.currentSchedule.assign[e][i];
+        const v = empsView[e] || {};
+        const isReq = !!(v.reqOffIdxSet && v.reqOffIdxSet[i]);
+        const isPaid = !!(v.paidIdxSet && v.paidIdxSet[i]);
+
+        // 表示寄せ（Webの見え方優先）
+        let out = "";
+        if (isPaid) out = (paidMode === 1 ? "有(見)" : (paidMode === 2 ? "有" : "有"));
+        else if (isReq) out = "休(希)";
+        else if (sh === SHIFT.DAY) out = "日";
+        else if (sh === SHIFT.NIGHT) out = "夜";
+        else if (sh === SHIFT.AKE) out = "明";
+        else if (sh === SHIFT.D_OFF) out = "休(D)";
+        else out = "休";
+
+        row.push(out);
+      }
       rows.push(row);
     }
 
-    // 人数行（参考）
-    const staffRow = ["人数"];
-    for (let i=0; i<days.length; i++) {
-      let dayCnt=0, nightCnt=0;
-      for (let e=0; e<state.employees.length; e++) {
+    const csv = rows.map(r => r.map(x => `"${String(x).replaceAll('"','""')}"`).join(",")).join("\r\n");
+    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `shift_${state.year}${pad2(state.month)}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  // ===== 見た目付きエクスポート（Excel互換 .xls / 1日を半分に分ける / 前半+後半を全再現） =====
+  function exportStyledExcel() {
+    if (!state.currentSchedule) { alert("先にシフトを生成してください"); return; }
+    readInputs();
+    buildEmployeesPayloadAndView();
+
+    const days = state.days;
+    const empsView = state.parsedEmployeesForView || [];
+    const paidMode = getPaidMode(); // 0/1/2
+
+    const dowJP = ["日","月","火","水","木","金","土"];
+    const lastDay = days.length;
+    const split = 15;
+    const ranges = [
+      { title: `${state.month}月 上旬`, start: 0, end: Math.min(split, lastDay), withCounts: false },
+      { title: `${state.month}月 下旬`, start: Math.min(split, lastDay), end: lastDay, withCounts: true },
+    ];
+
+    // 罫線・色（Web寄せ）
+    const CSS = `
+      <style>
+        table{ border-collapse:collapse; font-family: "Segoe UI","Noto Sans JP",sans-serif; font-size:11px; }
+        th,td{ border:1px solid #777; padding:2px 4px; text-align:center; height:18px; }
+        th.name, td.name{ text-align:left; white-space:nowrap; min-width:90px; }
+        th.secTitle{ background:#f6f8fb; font-weight:700; border:2px solid #000; }
+        th.topHead{ background:#f6f8fb; font-weight:700; }
+        .dayGroupL{ border-left:2px solid #000 !important; }
+        .dayGroupR{ border-right:2px solid #000 !important; }
+        .dayTop{ border-top:2px solid #000 !important; }
+        .dayBottom{ border-bottom:2px solid #000 !important; }
+
+        /* halves */
+        td.halfL, th.halfL{ min-width:22px; }
+        td.halfR, th.halfR{ min-width:22px; }
+
+        .bgDay{ background:#ffd1e6; }     /* 日勤ピンク */
+        .bgNight{ background:#cfe8ff; }   /* 夜勤薄青 */
+        .bgAke{ background:#f1f1f1; }     /* 明け */
+        .bgOff{ background:#eeeeee; }     /* 公休（薄灰） */
+        .bgReq{ background:#dcdcdc; }     /* 希望休（濃灰） */
+        .bgPaid{ background:#bfbfbf; }    /* 有給（さらに濃い灰） */
+
+        .countHead{ background:#f6f8fb; font-weight:700; border-left:2px solid #000 !important; min-width:88px; }
+        .countCell{ border-left:2px solid #000 !important; min-width:88px; }
+        .sumCell{ min-width:70px; }
+        .dCell{ min-width:80px; }
+        .staffRow th{ background:#f6f8fb; font-weight:700; }
+      </style>
+    `;
+
+    const esc = (s) => String(s ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;");
+
+    const shiftLabel = (e,i) => {
+      const sh = state.currentSchedule.assign[e][i];
+      const v = empsView[e] || {};
+      const isReq = !!(v.reqOffIdxSet && v.reqOffIdxSet[i]);
+      const isPaid = !!(v.paidIdxSet && v.paidIdxSet[i]);
+
+      if (isPaid) return { kind:"PAID", text:(paidMode===1 ? "有" : "有") };
+      if (isReq)  return { kind:"REQ",  text:"希" };
+      if (sh === SHIFT.DAY)   return { kind:"DAY", text:"日" };
+      if (sh === SHIFT.NIGHT) return { kind:"NIGHT", text:"夜" };
+      if (sh === SHIFT.AKE)   return { kind:"AKE", text:"明け" };
+      if (sh === SHIFT.D_OFF) return { kind:"D_OFF", text:"D休" };
+      return { kind:"OFF", text:"" };
+    };
+
+    const bgClassForKind = (kind) => {
+      if (kind==="DAY") return "bgDay";
+      if (kind==="NIGHT") return "bgNight";
+      if (kind==="AKE") return "bgAke";
+      if (kind==="REQ") return "bgReq";
+      if (kind==="PAID") return "bgPaid";
+      return "bgOff";
+    };
+
+    // counts (全期間)
+    const calcCountsAll = (e) => {
+      let totalMinAll = 0;
+      let cntDayAll=0, cntNightAll=0, cntOffNoAkeAll=0, cntAkeAll=0;
+      for (let i=0;i<lastDay;i++){
         const sh = state.currentSchedule.assign[e][i];
-        if (sh === SHIFT.DAY) dayCnt++;
-        if (sh === SHIFT.NIGHT) nightCnt++;
-      }
-      staffRow.push(`日${dayCnt}/夜${nightCnt}`);
-    }
-    rows.push(staffRow);
-
-    const csv = toCSV(rows);
-    const ym = (document.getElementById("month").value || "result").replace("-","");
-    downloadText(`shift_result_${ym}.csv`, csv, true);
-  }
-
-  // ===== Worker（省略なし） =====
-  const WORKER_CODE = `
-(() => {
-  const SHIFT = { OFF:"OFF", DAY:"DAY", NIGHT:"NIGHT", AKE:"AKE", D_OFF:"D_OFF" };
-  let paidMode = "none";
-
-  const deepCopySchedule = (s) => ({ assign: s.assign.map(r => r.slice()) });
-  const scheduleKey = (s) => s.assign.map(r => r.join("|")).join("||");
-  const emptySchedule = (nEmp, nDay) => ({ assign: Array.from({length:nEmp}, () => Array(nDay).fill(SHIFT.OFF)) });
-
-  const empTotalMin = (schedule, e, workMin, paidMode, employees) => {
-    let t = 0;
-    const row = schedule.assign[e];
-    const paidArr = employees && employees[e] ? employees[e].paidIdxSet : null;
-
-    for (let i = 0; i < row.length; i++) {
-      const sh = row[i];
-      let add = (workMin[sh] ?? 0);
-
-      // 有給モード2: 休み(OFF/D_OFF)だが 8h(=日勤) を労働時間に加算
-      if (paidMode === 2 && paidArr && paidArr[i] && (sh === SHIFT.OFF || sh === SHIFT.D_OFF)) {
-        add += 480;
-      }
-      t += add;
-    }
-    return t;
-  };
-  const empNightCount = (schedule, e) => schedule.assign[e].filter(x => x===SHIFT.NIGHT).length;
-
-  const empOffNoAkeCount = (schedule, e) => {
-    const row = schedule.assign[e];
-    let c=0;
-    for (let i=0;i<row.length;i++){
-      const sh = row[i];
-      if (sh === SHIFT.OFF || sh === SHIFT.D_OFF) c++;
-    }
-    return c;
-  };
-
-  function computeDCounts(schedule, days, employees) {
-    const nEmp = employees.length;
-    const nDay = days.length;
-    const dEarn = Array(nEmp).fill(0);
-    const dOff = Array(nEmp).fill(0);
-
-    for (let e=0; e<nEmp; e++) for (let i=0; i<nDay; i++) {
-      if (schedule.assign[e][i] === SHIFT.D_OFF) dOff[e]++;
-    }
-
-    for (let e=0; e<nEmp; e++) {
-      if (!employees[e].proper) continue;
-      for (let i=0; i<nDay; i++) {
-        const sh = schedule.assign[e][i];
-        const day = days[i];
-        if (sh === SHIFT.DAY && day.isHolOrWeekend) dEarn[e]++;
-        if (sh === SHIFT.NIGHT && day.isHoliday) dEarn[e]++;
-        if (sh === SHIFT.NIGHT && i+1 < nDay) {
-          const endDay = days[i+1];
-          if (endDay.isHolOrWeekend) dEarn[e]++;
+        const v = empsView[e] || {};
+        const isPaid = !!(v.paidIdxSet && v.paidIdxSet[i]);
+        const isPrevMonthAke = !!(v.prevMonthAkeIdxSet && v.prevMonthAkeIdxSet[i]); // 1日固定の明け（当月カウント除外）
+        if (!isPrevMonthAke) {
+          // 有給モード2：休み扱いだが8h加算
+          if (isPaid && paidMode===2) totalMinAll += 480;
+          else totalMinAll += (WORK_MIN[sh] ?? 0);
+          if (sh === SHIFT.DAY) cntDayAll++;
+          else if (sh === SHIFT.NIGHT) cntNightAll++;
+          else if (sh === SHIFT.AKE) cntAkeAll++;
+          else cntOffNoAkeAll++;
         }
       }
-    }
-    return { dEarn, dOff };
-  }
+      return { totalMinAll, cntDayAll, cntNightAll, cntOffNoAkeAll, cntAkeAll };
+    };
 
-  function isHardOffDay(employees, e, i, hardReqOffEnabled) {
-    const isReq = !!(hardReqOffEnabled && employees[e].reqOffIdxSet && employees[e].reqOffIdxSet[i]);
-    const isPaid = !!(employees[e].paidIdxSet && employees[e].paidIdxSet[i]);
-    return isReq || isPaid;
-  }
+    const buildSectionTable = (range) => {
+      if (range.start >= range.end) return "";
+      const colSpanDays = (range.end - range.start) * 2;
+      let html = "";
 
-  function isValidLocal(schedule, days, employees, e, i, sh, cfg, hardReqOffEnabled) {
-    const cur = schedule.assign[e][i];
+      // section title row
+      html += `<table><thead>`;
+      html += `<tr><th class="secTitle name" colspan="${1 + colSpanDays + (range.withCounts ? 3 : 0)}">${esc(range.title)}</th></tr>`;
 
-    // 前月末夜勤 → 当月1日は明け固定（変更不可）
-    if (i === 0 && employees[e].prevMonthNight) {
-      return sh === SHIFT.AKE;
-    }
-
-    if (isHardOffDay(employees, e, i, hardReqOffEnabled)) {
-      return (sh === SHIFT.OFF || sh === SHIFT.D_OFF);
-    }
-
-    if (cur === SHIFT.AKE && (sh === SHIFT.DAY || sh === SHIFT.NIGHT)) return false;
-
-    if (cfg.noDayAfterAke && sh === SHIFT.DAY && i>0 && schedule.assign[e][i-1] === SHIFT.AKE) return false;
-
-    if (sh === SHIFT.NIGHT) {
-      // ★日勤5連続の翌日は「休」必須（夜勤も禁止）
-      let run = 0;
-      for (let k=i-1; k>=0 && schedule.assign[e][k]===SHIFT.DAY; k--) run++;
-      if (run >= cfg.maxConsecDay) return false;
-
-      if (employees[e].proper && days[i].isHolOrWeekend) return false;
-
-      if (i+1 < days.length) {
-        const nxt = schedule.assign[e][i+1];
-        if (nxt === SHIFT.DAY || nxt === SHIFT.NIGHT) return false;
-        if (isHardOffDay(employees, e, i+1, hardReqOffEnabled)) return false;
+      // header row 1: date (colspan=2 each)
+      html += `<tr>`;
+      html += `<th class="topHead name" rowspan="2">社員</th>`;
+      for (let i=range.start;i<range.end;i++){
+        const clsL = "dayGroupL dayTop";
+        const clsR = "dayGroupR dayTop";
+        html += `<th class="topHead ${clsL}" colspan="2">${esc(days[i].d)}</th>`;
       }
-      if (i>0 && schedule.assign[e][i-1] === SHIFT.NIGHT) return false;
-    }
-
-    if (sh === SHIFT.DAY) {
-      let c=1;
-      for (let k=i-1; k>=0 && schedule.assign[e][k]===SHIFT.DAY; k--) c++;
-      for (let k=i+1; k<days.length && schedule.assign[e][k]===SHIFT.DAY; k++) c++;
-      if (c > cfg.maxConsecDay) return false;
-    }
-
-    return true;
-  }
-
-  function enforceHardOff(schedule, employees, hardReqOffEnabled) {
-    if (!hardReqOffEnabled) return;
-    const nEmp = employees.length, nDay = schedule.assign[0].length;
-
-    for (let e=0;e<nEmp;e++){
-      const reqArr = employees[e].reqOffIdxSet;
-      const paidArr = employees[e].paidIdxSet;
-      if (!reqArr && !paidArr) continue;
-
-      for (let i=0; i<nDay; i++){
-        const hard = (!!(reqArr && reqArr[i] && hardReqOffEnabled)) || (!!(paidArr && paidArr[i]));
-        if (!hard) continue;
-        if (i>0 && schedule.assign[e][i-1] === SHIFT.NIGHT) schedule.assign[e][i-1] = SHIFT.OFF;
-        schedule.assign[e][i] = SHIFT.OFF;
-        if (i+1 < nDay && schedule.assign[e][i+1] === SHIFT.AKE) schedule.assign[e][i+1] = SHIFT.OFF;
+      if (range.withCounts){
+        html += `<th class="countHead" rowspan="2">日/夜/休(明除)/明</th>`;
+        html += `<th class="topHead sumCell" rowspan="2">合計(時間)</th>`;
+        html += `<th class="topHead dCell" rowspan="2">D勤/D休</th>`;
       }
-    }
-  }
+      html += `</tr>`;
 
-  function enforcePrevMonthAke(schedule, employees) {
-    if (!schedule || !schedule.assign || !schedule.assign.length) return;
-    const nEmp = employees.length;
-    const nDay = schedule.assign[0].length;
-    if (nDay <= 0) return;
-    for (let e=0;e<nEmp;e++){
-      if (!employees[e].prevMonthNight) continue;
-      schedule.assign[e][0] = SHIFT.AKE;
-    }
-  }
+      // header row 2: dow (colspan=2 each)
+      html += `<tr>`;
+      for (let i=range.start;i<range.end;i++){
+        html += `<th class="topHead dayGroupL" colspan="2">${esc(dowJP[days[i].dow])}</th>`;
+      }
+      html += `</tr></thead><tbody>`;
 
-  function normalizeAkeConsistency(schedule, days, employees, cfg, hardReqOffEnabled) {
-    const nEmp = employees.length;
-    const nDay = days.length;
+      // employee rows
+      for (let e=0; e<state.employees.length; e++){
+        html += `<tr>`;
+        html += `<td class="name">${esc(state.employees[e].name)}</td>`;
 
-    // 1) 先月末が夜勤なら当月1日は「明」で固定（表示/カウントはUI側で調整）
-    for (let e=0; e<nEmp; e++) {
-      if (employees[e].prevMonthNight) schedule.assign[e][0] = SHIFT.AKE;
-    }
+        for (let i=range.start;i<range.end;i++){
+          const info = shiftLabel(e,i);
 
-    // 2) 孤立した「明」（前日が夜勤でない明）はOFFに戻す（※1日固定の明は除外）
-    for (let e=0; e<nEmp; e++) {
-      for (let i=0; i<nDay; i++) {
-        if (i === 0 && employees[e].prevMonthNight) continue;
-        if (schedule.assign[e][i] === SHIFT.AKE) {
-          if (i === 0 || schedule.assign[e][i-1] !== SHIFT.NIGHT) {
-            schedule.assign[e][i] = SHIFT.OFF;
+          // day group borders
+          const baseL = "dayGroupL";
+          const baseR = "dayGroupR";
+
+          if (info.kind === "DAY"){
+            html += `<td class="halfL ${baseL} ${bgClassForKind("DAY")}">${esc(info.text)}</td>`;
+            html += `<td class="halfR ${baseR}"></td>`;
+          } else if (info.kind === "NIGHT"){
+            html += `<td class="halfL ${baseL}"></td>`;
+            html += `<td class="halfR ${baseR} ${bgClassForKind("NIGHT")}">${esc(info.text)}</td>`;
+          } else {
+            const bg = bgClassForKind(info.kind);
+            html += `<td class="${baseL} ${bg}" colspan="2">${esc(info.text)}</td>`;
           }
         }
-      }
-    }
 
-    // 3) 夜勤は必ず翌日「明」にする（希望休ハードで翌日OFF固定なら夜勤自体をOFFに戻す）
-    for (let e=0; e<nEmp; e++) {
-      for (let i=0; i<nDay-1; i++) {
-        if (schedule.assign[e][i] !== SHIFT.NIGHT) continue;
-
-        if (hardReqOffEnabled && employees[e].reqOffIdxSet && employees[e].reqOffIdxSet[i+1]) {
-          schedule.assign[e][i] = SHIFT.OFF;
-          continue;
+        if (range.withCounts){
+          const { totalMinAll, cntDayAll, cntNightAll, cntOffNoAkeAll, cntAkeAll } = calcCountsAll(e);
+          html += `<td class="countCell">${esc(`日${cntDayAll}/夜${cntNightAll}/休${cntOffNoAkeAll}/明${cntAkeAll}`)}</td>`;
+          html += `<td class="sumCell">${esc((totalMinAll/60).toFixed(1))}</td>`;
+          const { dEarn, dOff } = computeDCounts(state.currentSchedule, days, empsView);
+          html += `<td class="dCell">${esc(state.employees[e].proper ? `D勤${dEarn[e]}/D休${dOff[e]}` : "-")}</td>`;
         }
-        schedule.assign[e][i+1] = SHIFT.AKE;
-      }
-    }
 
-    // 4) 希望休ハード日の「明」は前日の夜勤を解除してOFFにする
-    if (hardReqOffEnabled) {
-      for (let e=0; e<nEmp; e++) {
-        const arr = employees[e].reqOffIdxSet;
-        if (!arr) continue;
-        for (let i=0; i<nDay; i++) {
-          if (!arr[i]) continue;
-          if (schedule.assign[e][i] === SHIFT.AKE && i > 0 && schedule.assign[e][i-1] === SHIFT.NIGHT) {
-            schedule.assign[e][i-1] = SHIFT.OFF;
-            schedule.assign[e][i] = SHIFT.OFF;
-          }
+        html += `</tr>`;
+      }
+
+      // staff row
+      html += `<tr class="staffRow"><th class="name">人数</th>`;
+      for (let i=range.start;i<range.end;i++){
+        let dayCnt=0, nightCnt=0;
+        for (let e=0;e<state.employees.length;e++){
+          const sh = state.currentSchedule.assign[e][i];
+          if (sh===SHIFT.DAY) dayCnt++;
+          if (sh===SHIFT.NIGHT) nightCnt++;
         }
+        html += `
+          <td class="dayGroupL dayBottom">${esc(dayCnt)}</td>
+          <td class="dayGroupR dayBottom">${esc(nightCnt)}</td>
+        `;
       }
-    }
-  }
+      if (range.withCounts){
+        html += `<td class="countCell"></td><td class="sumCell"></td><td class="dCell"></td>`;
+      }
+      html += `</tr>`;
 
-
-  function allocateDOff(schedule, days, employees, cfg, hardReqOffEnabled) {
-    const nEmp = employees.length;
-    const nDay = days.length;
-
-    for (let e=0;e<nEmp;e++) for (let i=0;i<nDay;i++){
-      if (schedule.assign[e][i]===SHIFT.D_OFF) schedule.assign[e][i]=SHIFT.OFF;
-    }
-
-    const dayCount = (i) => {
-      let c=0;
-      for (let e=0;e<nEmp;e++) if (schedule.assign[e][i]===SHIFT.DAY) c++;
-      return c;
+      html += `</tbody></table><br/>`;
+      return html;
     };
 
-    const canPutDay = (f, i) => {
-      const cur = schedule.assign[f][i];
-      if (cur === SHIFT.NIGHT || cur === SHIFT.AKE) return false;
-      if (cur === SHIFT.DAY) return false;
-      return isValidLocal(schedule, days, employees, f, i, SHIFT.DAY, cfg, hardReqOffEnabled);
-    };
+    const body = ranges.map(buildSectionTable).join("");
 
-    const { dEarn } = computeDCounts(schedule, days, employees);
+    const html = `
+      <html><head><meta charset="utf-8">${CSS}</head>
+      <body>${body}</body></html>
+    `;
 
-    for (let e=0; e<nEmp; e++) {
-      if (!employees[e].proper) continue;
-
-      let need = dEarn[e];
-      if (need <= 0) continue;
-
-      const offSlots = [];
-      for (let i=0;i<nDay;i++){
-        if (days[i].isHolOrWeekend) continue;
-        if (schedule.assign[e][i] === SHIFT.OFF) {
-          if (hardReqOffEnabled && isHardOffDay(employees, e, i, hardReqOffEnabled)) continue;
-          offSlots.push(i);
-        }
-      }
-      for (let k=0; k<offSlots.length && need>0; k++){
-        schedule.assign[e][offSlots[k]] = SHIFT.D_OFF;
-        need--;
-      }
-      if (need === 0) continue;
-
-      const daySlots = [];
-      for (let i=0;i<nDay;i++){
-        if (days[i].isHolOrWeekend) continue;
-        if (schedule.assign[e][i] === SHIFT.DAY) daySlots.push(i);
-      }
-      for (let i=daySlots.length-1;i>0;i--){
-        const j = (Math.random()*(i+1))|0;
-        [daySlots[i],daySlots[j]]=[daySlots[j],daySlots[i]];
-      }
-
-      for (let idx=0; idx<daySlots.length && need>0; idx++){
-        const i = daySlots[idx];
-        const dc = dayCount(i);
-
-        if (dc - 1 >= cfg.minDay) {
-          schedule.assign[e][i] = SHIFT.D_OFF;
-          need--;
-          continue;
-        }
-
-        let filled = false;
-        for (let f=0; f<nEmp; f++){
-          if (f===e) continue;
-          if (!canPutDay(f, i)) continue;
-
-          schedule.assign[f][i] = SHIFT.DAY;
-          schedule.assign[e][i] = SHIFT.D_OFF;
-          filled = true;
-          need--;
-          break;
-        }
-        if (!filled) schedule.assign[e][i] = SHIFT.DAY;
-      }
-
-      if (need > 0) return false;
-    }
-
-    return true;
+    const blob = new Blob([html], { type: "application/vnd.ms-excel;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `shift_${state.year}${pad2(state.month)}_styled_half.xls`;
+    a.click();
+    URL.revokeObjectURL(a.href);
   }
 
-  function hardViolationsCount(schedule, days, employees, cfg, monthRules, hardReqOffEnabled) {
-    const nEmp = employees.length;
-    const nDay = days.length;
-    let issues = 0;
-
-    for (let i=0;i<nDay;i++){
-      let dayCnt=0, nightCnt=0;
-      for (let e=0;e<nEmp;e++){
-        const sh = schedule.assign[e][i];
-        if (sh===SHIFT.DAY) dayCnt++;
-        if (sh===SHIFT.NIGHT) nightCnt++;
-      }
-      if (nightCnt !== cfg.requiredNight) issues++;
-      if (dayCnt < cfg.minDay) issues++;
-      if (dayCnt > cfg.maxDay) issues++;
-    }
-
-    for (let e=0;e<nEmp;e++){
-      let consecDay=0;
-      let nightSetRun=0;
-
-      for (let i=0;i<nDay;i++){
-        const sh = schedule.assign[e][i];
-
-        if (isHardOffDay(employees, e, i, hardReqOffEnabled)) {
-          if (sh !== SHIFT.OFF && sh !== SHIFT.D_OFF) issues++;
-        }
-
-        if (sh===SHIFT.DAY) consecDay++; else consecDay=0;
-        // ★日勤5連続の翌日は「休」必須（夜勤も禁止）
-        if (sh===SHIFT.NIGHT) {
-          let run=0;
-          for (let k=i-1; k>=0 && schedule.assign[e][k]===SHIFT.DAY; k--) run++;
-          if (run >= cfg.maxConsecDay) issues++;
-        }
-        if (consecDay > cfg.maxConsecDay) issues++;
-
-        if (employees[e].proper && sh===SHIFT.NIGHT && days[i].isHolOrWeekend) issues++;
-        if (sh===SHIFT.NIGHT && i+1 < nDay && schedule.assign[e][i+1] !== SHIFT.AKE) issues++;
-        if (i>0 && schedule.assign[e][i-1]===SHIFT.NIGHT && sh===SHIFT.NIGHT) issues++;
-        if (cfg.noDayAfterAke && i>0 && schedule.assign[e][i-1]===SHIFT.AKE && sh===SHIFT.DAY) issues++;
-
-        if (sh===SHIFT.NIGHT) {
-          const continues = (i>=2 && schedule.assign[e][i-1]===SHIFT.AKE && schedule.assign[e][i-2]===SHIFT.NIGHT);
-          nightSetRun = continues ? (nightSetRun+1) : 1;
-          if (nightSetRun > cfg.maxNightSetRun) issues++;
-        }
-        if (sh !== SHIFT.NIGHT && sh !== SHIFT.AKE) nightSetRun = 0;
-      }
-    }
-
-    for (let e=0;e<nEmp;e++){
-      const total = empTotalMin(schedule,e,cfg.workMin,paidMode,employees);
-      if (monthRules.minMin>0 && total < monthRules.minMin) issues++;
-      if (monthRules.maxMin>0 && total > monthRules.maxMin) issues++;
-    }
-
-    const { dEarn, dOff } = computeDCounts(schedule, days, employees);
-    for (let e=0;e<nEmp;e++){
-      if (!employees[e].proper) continue;
-      if (dEarn[e] > cfg.maxDDays) issues++;
-      if (dEarn[e] !== dOff[e]) issues++;
-    }
-
-    return issues;
-  }
-
-  function scoreSchedule(schedule, days, employees, cfg, monthRules) {
-    const nEmp = employees.length;
-    const nDay = days.length;
-    let score = 0;
-
-    for (let i=0;i<nDay;i++){
-      let dayCnt=0, nightCnt=0;
-      for (let e=0;e<nEmp;e++){
-        const sh = schedule.assign[e][i];
-        if (sh===SHIFT.DAY) dayCnt++;
-        if (sh===SHIFT.NIGHT) nightCnt++;
-      }
-
-      score -= Math.abs(nightCnt - cfg.requiredNight) * 5000;
-      if (dayCnt < cfg.minDay) score -= (cfg.minDay - dayCnt) * 5000;
-      if (dayCnt > cfg.maxDay) score -= (dayCnt - cfg.maxDay) * 5000;
-
-      score -= Math.abs(dayCnt - cfg.targetDay) * 60;
-    }
-
-    for (let e=0;e<nEmp;e++){
-      const total = empTotalMin(schedule,e,cfg.workMin,paidMode,employees);
-      score -= Math.abs(total - monthRules.stdMin) * 0.6;
-    }
-
-    // 平日日勤優先（強化：ほぼ固定 + 夜勤は月1〜3回想定）
-    for (let e=0;e<nEmp;e++){
-      if (!employees[e].weekdayDayPriority) continue;
-
-      let nightCnt = 0;
-      for (let i=0;i<nDay;i++){
-        const sh = schedule.assign[e][i];
-        if (sh===SHIFT.NIGHT) nightCnt++;
-
-        // 平日（祝日/土日以外）は「日」寄せ
-        if (!days[i].isHolOrWeekend) {
-          if (sh===SHIFT.DAY) score += 200;
-          else if (sh===SHIFT.OFF || sh===SHIFT.D_OFF) score -= 220;
-          else if (sh===SHIFT.NIGHT) score -= 320;
-          else if (sh===SHIFT.AKE) score -= 120;
-        } else {
-          // 土日祝は「休」寄せ（ただし必須人数の都合で出勤は許容）
-          if (sh===SHIFT.OFF || sh===SHIFT.D_OFF) score += 40;
-          else if (sh===SHIFT.DAY) score -= 25;
-          else if (sh===SHIFT.NIGHT) score -= 10;
-          else if (sh===SHIFT.AKE) score -= 5;
-        }
-      }
-
-      // 夜勤回数の目安（ソフト）
-      const MIN_N = 1, MAX_N = 3;
-      if (nightCnt < MIN_N) score -= (MIN_N - nightCnt) * 800;
-      if (nightCnt > MAX_N) score -= (nightCnt - MAX_N) * 800;
-    }
-
-    const W_MATCH = 25;
-    const W_MISS  = 30;
-    for (let e=0;e<nEmp;e++){
-      const wish = employees[e].wishShiftIdxMap;
-      if (!wish) continue;
-      for (let i=0;i<nDay;i++){
-        const w = wish[i];
-        if (!w) continue;
-        const sh = schedule.assign[e][i];
-        if (sh === w) score += W_MATCH;
-        else score -= W_MISS;
-      }
-    }
-
-    const { dEarn, dOff } = computeDCounts(schedule, days, employees);
-    for (let e=0;e<nEmp;e++){
-      if (!employees[e].proper) continue;
-      score -= dEarn[e] * 5;
-      score -= Math.abs(dEarn[e]-dOff[e]) * 200;
-    }
-
-    const offCounts = new Array(nEmp);
-    let sumOff = 0;
-    for (let e=0;e<nEmp;e++){
-      const c = empOffNoAkeCount(schedule, e);
-      offCounts[e] = c;
-      sumOff += c;
-    }
-    const meanOff = sumOff / Math.max(1, nEmp);
-    const OFF_STD_WEIGHT = 200;
-    for (let e=0;e<nEmp;e++){
-      score -= Math.abs(offCounts[e] - meanOff) * OFF_STD_WEIGHT;
-    }
-
-    return score;
-  }
-
-  function repairStaffing(s, days, employees, cfg, monthRules, hardReqOffEnabled) {
-    const nEmp = employees.length, nDay = days.length;
-
-    enforcePrevMonthAke(s, employees);
-    enforceHardOff(s, employees, hardReqOffEnabled);
-    normalizeAkeConsistency(s, days, employees, cfg, hardReqOffEnabled);
-
-    for (let i=0;i<nDay;i++){
-      const nightEs = [];
-      for (let e=0;e<nEmp;e++) if (s.assign[e][i]===SHIFT.NIGHT) nightEs.push(e);
-
-      if (nightEs.length > cfg.requiredNight) {
-        while (nightEs.length > cfg.requiredNight) {
-          const e = nightEs.pop();
-          s.assign[e][i] = SHIFT.OFF;
-        }
-      } else if (nightEs.length < cfg.requiredNight) {
-        const need = cfg.requiredNight - nightEs.length;
-        const cand = [];
-        for (let e=0;e<nEmp;e++){
-          if (s.assign[e][i]===SHIFT.NIGHT) continue;
-          if (!isValidLocal(s, days, employees, e, i, SHIFT.NIGHT, cfg, hardReqOffEnabled)) continue;
-          cand.push({e, n: empNightCount(s,e), t: empTotalMin(s,e,cfg.workMin,paidMode,employees), r: Math.random()});
-        }
-        cand.sort((a,b)=> (a.n-b.n)||(a.t-b.t)||(a.r-b.r));
-        for (let k=0;k<need && k<cand.length;k++){
-          const ePick = cand[k].e;
-          s.assign[ePick][i] = SHIFT.NIGHT;
-          if (i+1 < nDay) s.assign[ePick][i+1] = SHIFT.AKE;
-        }
-      }
-
-      if (i+1 < nDay) {
-        for (let e=0;e<nEmp;e++){
-          if (s.assign[e][i]===SHIFT.NIGHT) s.assign[e][i+1] = SHIFT.AKE;
-        }
-      }
-    }
-
-    for (let i=0;i<nDay;i++){
-      let dayCnt=0;
-      for (let e=0;e<nEmp;e++) if (s.assign[e][i]===SHIFT.DAY) dayCnt++;
-      if (dayCnt >= cfg.minDay) continue;
-
-      const need = cfg.minDay - dayCnt;
-      const cand = [];
-      for (let e=0;e<nEmp;e++){
-        const cur = s.assign[e][i];
-        if (cur===SHIFT.NIGHT || cur===SHIFT.AKE || cur===SHIFT.DAY) continue;
-        if (!isValidLocal(s, days, employees, e, i, SHIFT.DAY, cfg, hardReqOffEnabled)) continue;
-        const t = empTotalMin(s,e,cfg.workMin,paidMode,employees);
-        const pref = (employees[e].weekdayDayPriority && !days[i].isHolOrWeekend) ? -1 : 0;
-        cand.push({e, pref, t, r: Math.random()});
-      }
-      cand.sort((a,b)=> (a.pref-b.pref)||(a.t-b.t)||(a.r-b.r));
-      for (let k=0;k<need && k<cand.length;k++) s.assign[cand[k].e][i] = SHIFT.DAY;
-    }
-
-    for (let i=0;i<nDay;i++){
-      let dayEs = [];
-      for (let e=0;e<nEmp;e++) if (s.assign[e][i]===SHIFT.DAY) dayEs.push(e);
-      if (dayEs.length <= cfg.maxDay) continue;
-
-      const cand = dayEs.map(e => ({
-        e,
-        pref: (employees[e].weekdayDayPriority && !days[i].isHolOrWeekend) ? 1 : 0,
-        t: empTotalMin(s,e,cfg.workMin,paidMode,employees),
-        r: Math.random()
-      }));
-      cand.sort((a,b)=> (b.pref-a.pref) || (a.t-b.t) || (a.r-b.r));
-
-      for (let k=cfg.maxDay; k<cand.length; k++){
-        s.assign[cand[k].e][i] = SHIFT.OFF;
-      }
-    }
-
-    allocateDOff(s, days, employees, cfg, hardReqOffEnabled);
-    enforceHardOff(s, employees, hardReqOffEnabled);
-    normalizeAkeConsistency(s, days, employees, cfg, hardReqOffEnabled);
-    enforcePrevMonthAke(s, employees);
-  }
-
-  function buildInitialSchedule(days, employees, cfg, monthRules, hardReqOffEnabled) {
-    const s = emptySchedule(employees.length, days.length);
-
-    enforcePrevMonthAke(s, employees);
-    enforceHardOff(s, employees, hardReqOffEnabled);
-    enforcePrevMonthAke(s, employees);
-
-    for (let i=0;i<days.length;i++){
-      const cand = [];
-      for (let e=0;e<employees.length;e++){
-        if (!isValidLocal(s, days, employees, e, i, SHIFT.NIGHT, cfg, hardReqOffEnabled)) continue;
-        cand.push({e, n: empNightCount(s,e), t: empTotalMin(s,e,cfg.workMin,paidMode,employees), r:Math.random()});
-      }
-      cand.sort((a,b)=> (a.n-b.n)||(a.t-b.t)||(a.r-b.r));
-      if (cand.length < cfg.requiredNight) return null;
-      for (let k=0;k<cfg.requiredNight;k++){
-        const ePick = cand[k].e;
-        s.assign[ePick][i] = SHIFT.NIGHT;
-        if (i+1 < days.length) s.assign[ePick][i+1] = SHIFT.AKE;
-      }
-    }
-
-    for (let i=0;i<days.length;i++){
-      const cand = [];
-      for (let e=0;e<employees.length;e++){
-        const cur = s.assign[e][i];
-        if (cur===SHIFT.NIGHT || cur===SHIFT.AKE) continue;
-        if (!isValidLocal(s, days, employees, e, i, SHIFT.DAY, cfg, hardReqOffEnabled)) continue;
-        const t = empTotalMin(s,e,cfg.workMin,paidMode,employees);
-        const pref = (employees[e].weekdayDayPriority && !days[i].isHolOrWeekend) ? -1 : 0;
-        cand.push({e, pref, t, r:Math.random()});
-      }
-      cand.sort((a,b)=> (a.pref-b.pref)||(a.t-b.t)||(a.r-b.r));
-      if (cand.length < cfg.minDay) return null;
-
-      for (let k=0; k<cfg.minDay; k++) s.assign[cand[k].e][i] = SHIFT.DAY;
-
-      const extra = Math.min(cfg.maxDay, cfg.targetDay) - cfg.minDay;
-      for (let k=0; k<extra; k++){
-        const idx = cfg.minDay + k;
-        if (idx < cand.length) s.assign[cand[idx].e][i] = SHIFT.DAY;
-      }
-    }
-
-    if (!allocateDOff(s, days, employees, cfg, hardReqOffEnabled)) return null;
-    repairStaffing(s, days, employees, cfg, monthRules, hardReqOffEnabled);
-    return s;
-  }
-
-  function mutate(schedule, days, employees, cfg, monthRules, hardReqOffEnabled) {
-    const s = deepCopySchedule(schedule);
-    const nEmp = employees.length;
-    const nDay = days.length;
-
-    const op = Math.random();
-
-    if (op < 0.45) {
-      let i = (Math.random()*nDay)|0;
-      if (nDay > 1 && i === 0) i = 1;
-      const a = (Math.random()*nEmp)|0;
-      let b = (Math.random()*nEmp)|0;
-      if (a===b) b = (b+1)%nEmp;
-
-      if (!isHardOffDay(employees, a, i, hardReqOffEnabled) && !isHardOffDay(employees, b, i, hardReqOffEnabled)) {
-        const sa = s.assign[a][i], sb = s.assign[b][i];
-        if (sa === SHIFT.AKE || sb === SHIFT.AKE) {
-          if (s.assign[a][i] !== SHIFT.NIGHT && s.assign[a][i] !== SHIFT.AKE) {
-            s.assign[a][i] = (s.assign[a][i] === SHIFT.DAY ? SHIFT.OFF : SHIFT.DAY);
-            if (sa === SHIFT.D_OFF) s.assign[a][i] = SHIFT.OFF;
-          }
-        } else {
-          s.assign[a][i] = sb;
-          s.assign[b][i] = sa;
-        }
-      }
-    } else if (op < 0.75) {
-      const e = (Math.random()*nEmp)|0;
-      let i = (Math.random()*nDay)|0;
-      if (nDay > 1 && i === 0) i = 1;
-      if (!isHardOffDay(employees, e, i, hardReqOffEnabled)) {
-        const cur = s.assign[e][i];
-        if (cur !== SHIFT.NIGHT && cur !== SHIFT.AKE) {
-          s.assign[e][i] = (cur === SHIFT.DAY ? SHIFT.OFF : SHIFT.DAY);
-          if (cur === SHIFT.D_OFF) s.assign[e][i] = SHIFT.OFF;
-        }
-      }
-    } else {
-      let i = (Math.random()*nDay)|0;
-      if (nDay > 1 && i === 0) i = 1;
-      for (let e=0;e<nEmp;e++) if (s.assign[e][i]===SHIFT.NIGHT) s.assign[e][i]=SHIFT.OFF;
-      if (i+1<nDay) for (let e=0;e<nEmp;e++) if (s.assign[e][i+1]===SHIFT.AKE) s.assign[e][i+1]=SHIFT.OFF;
-
-      const cand = [];
-      for (let e=0;e<nEmp;e++){
-        if (!isValidLocal(s, days, employees, e, i, SHIFT.NIGHT, cfg, hardReqOffEnabled)) continue;
-        cand.push({e, n: empNightCount(s,e), t: empTotalMin(s,e,cfg.workMin,paidMode,employees), r:Math.random()});
-      }
-      cand.sort((a,b)=> (a.n-b.n)||(a.t-b.t)||(a.r-b.r));
-      if (cand.length >= cfg.requiredNight) {
-        for (let k=0;k<cfg.requiredNight;k++){
-          const ePick = cand[k].e;
-          s.assign[ePick][i] = SHIFT.NIGHT;
-          if (i+1<nDay) s.assign[ePick][i+1]=SHIFT.AKE;
-        }
-      }
-    }
-
-    repairStaffing(s, days, employees, cfg, monthRules, hardReqOffEnabled);
-    return s;
-  }
-
-  function buildSummary(schedule, employees, cfg, monthRules, days) {
-    const nEmp = employees.length;
-    const totals = employees.map((_,e)=> empTotalMin(schedule,e,cfg.workMin,paidMode,employees));
-    const avg = totals.reduce((a,b)=>a+b,0)/nEmp;
-
-    const { dEarn, dOff } = computeDCounts(schedule, days, employees);
-    const properInfo = employees
-      .map((emp,e)=> emp.proper ? \`\${emp.name}:D勤\${dEarn[e]}/D休\${dOff[e]}\` : null)
-      .filter(Boolean)
-      .slice(0,6)
-      .join(" / ");
-
-    return {
-      avgHr:(avg/60).toFixed(1),
-      minHr:(Math.min(...totals)/60).toFixed(1),
-      maxHr:(Math.max(...totals)/60).toFixed(1),
-      properInfo
-    };
-  }
-
-  function search(payload) {
-    const start = performance.now();
-    const limitMs = payload.limitMs;
-
-    const cfg = {
-      requiredNight: payload.requiredNight,
-      minDay: payload.minDay,
-      maxDay: payload.maxDay,
-      targetDay: payload.targetDay,
-      maxConsecDay: payload.maxConsecDay,
-      maxNightSetRun: payload.maxNightSetRun,
-      noDayAfterAke: payload.noDayAfterAke,
-      maxDDays: payload.maxDDays,
-      workMin: payload.workMin,
-    };
-
-    const employees = payload.employees;
-    const days = payload.days;
-    const monthRules = payload.monthRules;
-    const hardReqOffEnabled = !!payload.hardReqOffEnabled;
-    paidMode = payload.paidMode || "none";
-
-    // --- A案：初期解（init）を内部でリトライしてから探索開始 ---
-    let init = null;
-    const INIT_TRIES_MAX = 120;
-    for (let t=0; t<INIT_TRIES_MAX; t++){
-      init = buildInitialSchedule(days, employees, cfg, monthRules, hardReqOffEnabled);
-      if (init) break;
-      if (performance.now() - start > limitMs * 0.20) break;
-    }
-    if (!init) return { iter:0, candidates:[] };
-
-    const seen = new Set();
-    const best = [];
-
-    function consider(s) {
-      const hv = hardViolationsCount(s, days, employees, cfg, monthRules, hardReqOffEnabled);
-      if (hv !== 0) return;
-
-      const sc = scoreSchedule(s, days, employees, cfg, monthRules);
-      const key = scheduleKey(s);
-      if (seen.has(key)) return;
-      seen.add(key);
-
-      best.push({ score: sc, schedule: s, summary: buildSummary(s, employees, cfg, monthRules, days) });
-      best.sort((a,b)=> b.score - a.score);
-      if (best.length > 4) best.pop();
-    }
-
-    let cur = init;
-    consider(cur);
-
-    let iter = 0;
-    let lastProgress = 0;
-
-    while (performance.now() - start < limitMs) {
-      iter++;
-      const nxt = mutate(cur, days, employees, cfg, monthRules, hardReqOffEnabled);
-
-      const hvCur = hardViolationsCount(cur, days, employees, cfg, monthRules, hardReqOffEnabled);
-      const hvNxt = hardViolationsCount(nxt, days, employees, cfg, monthRules, hardReqOffEnabled);
-
-      const scCur = scoreSchedule(cur, days, employees, cfg, monthRules) - hvCur * 10000;
-      const scNxt = scoreSchedule(nxt, days, employees, cfg, monthRules) - hvNxt * 10000;
-
-      const elapsed = performance.now() - start;
-      const t = Math.max(0.05, 1.0 - elapsed/limitMs);
-      const accept = (scNxt >= scCur) || (Math.random() < Math.exp((scNxt - scCur) / (220 * t)));
-      if (accept) cur = nxt;
-
-      consider(nxt);
-      if (best.length === 4 && iter % 250 === 0) cur = deepCopySchedule(best[0].schedule);
-
-      if (elapsed - lastProgress > 150) {
-        lastProgress = elapsed;
-        postMessage({ type:"progress", iter, elapsedMs: elapsed, bestCount: best.length });
-      }
-    }
-
-    return { iter, candidates: best };
-  }
-
-  onmessage = (ev) => {
-    try {
-      const msg = ev.data;
-      if (!msg || msg.type !== "start") return;
-      const result = search(msg);
-      postMessage({ type:"done", iter: result.iter, candidates: result.candidates });
-    } catch (e) {
-      postMessage({ type:"error", error: (e && e.stack) ? e.stack : String(e) });
-    }
-  };
-})();
-`;
+const WORKER_CODE = document.getElementById("workerCode").textContent;
 
   let solverWorker = null;
 
@@ -2522,6 +2755,7 @@ grid.appendChild(wishHint);
     document.getElementById("btnEmpExport").addEventListener("click", exportEmployeesCSV);
     document.getElementById("btnEmpImport").addEventListener("click", () => document.getElementById("empCsvFile").click());
     document.getElementById("btnResultExport").addEventListener("click", exportResultCSV);
+    document.getElementById("btnResultExportStyled").addEventListener("click", exportStyledExcel);
 
     // Employee add/remove
     document.getElementById("btnAddEmp").addEventListener("click", () => {
