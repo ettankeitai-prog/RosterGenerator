@@ -7,7 +7,7 @@ RosterGenerator
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>シフト表作成（2段ヘッダー / 日夜左右分割 / 折り返し / 希望休・祝日=日付のみ / 微調整 / 印刷A4横 / CSV入出力）</title>
+  <title>シフト表作成</title>
   <style>
     :root { --bg:#0b0f14; --panel:#121925; --muted:#7f8ea3; --text:#e7eefb; --bad:#ff5c5c; }
     :root{
